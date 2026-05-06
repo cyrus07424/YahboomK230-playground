@@ -19,8 +19,6 @@ from ybUtils.YbKey import YbKey
 from ybUtils.YbRGB import YbRGB
 
 # カスタムYOLOv8セグメンテーションクラス Custom YOLOv8 Segmentation Class
-
-
 class BuzzerAlert:
     def __init__(self, frequency=2000, volume=50, duration=0.1, interval_ms=300):
         self.buzzer = YbBuzzer()
@@ -66,24 +64,33 @@ class AlertToggleButton:
 
 class LedIndicator:
     OFF = (0, 0, 0)
-    GREEN = (0, 255, 0)
-    RED = (255, 0, 0)
 
     def __init__(self):
         self.led = YbRGB()
         self.current_color = None
         self.off()
 
-    def update(self, vehicle_detected, collision_risk):
-        if collision_risk:
-            self.show(self.RED)
-        elif vehicle_detected:
-            self.show(self.GREEN)
+    def update(self, visible, risk_score):
+        if visible:
+            self.show(self.risk_to_color(risk_score))
         else:
             self.show(self.OFF)
 
     def off(self):
         self.show(self.OFF)
+
+    def risk_to_color(self, risk_score):
+        risk_score = self.clamp01(risk_score)
+        red = int(255 * risk_score)
+        green = int(255 * (1.0 - risk_score))
+        return (red, green, 0)
+
+    def clamp01(self, value):
+        if value < 0.0:
+            return 0.0
+        if value > 1.0:
+            return 1.0
+        return value
 
     def show(self, color):
         if self.current_color != color:
@@ -92,7 +99,7 @@ class LedIndicator:
 
 
 class SegmentationApp(AIBase):
-    def __init__(self, kmodel_path, labels, model_input_size, confidence_threshold=0.2, nms_threshold=0.5, mask_threshold=0.5, rgb888p_size=[224, 224], display_size=[1920, 1080], debug_mode=0, alert_labels=("person", "bicycle", "car", "motorcycle", "bus", "truck"), vehicle_labels=("bicycle", "car", "motorcycle", "bus", "truck", "train", "boat")):
+    def __init__(self, kmodel_path, labels, model_input_size, confidence_threshold=0.2, nms_threshold=0.5, mask_threshold=0.5, rgb888p_size=[224, 224], display_size=[1920, 1080], debug_mode=0, alert_labels=("person", "bicycle", "car", "motorcycle", "bus", "truck"), vehicle_labels=("bicycle", "car", "motorcycle", "bus", "truck", "train", "boat"), alert_risk_threshold=0.72):
         """
         セグメンテーションアプリケーションクラスを初期化する
         Initialize the segmentation application class
@@ -122,6 +129,7 @@ class SegmentationApp(AIBase):
         for label in vehicle_labels:
             if label in self.labels:
                 self.vehicle_label_ids.add(self.labels.index(label))
+        self.alert_risk_threshold = alert_risk_threshold
         # モデル入力解像度 / Model input resolution
         self.model_input_size = model_input_size
         # 信頼度しきい値 / Confidence threshold
@@ -248,7 +256,19 @@ class SegmentationApp(AIBase):
         indicator_y = 10
         pl.osd_img.draw_string_advanced(indicator_x, indicator_y, 24, indicator_text, color=indicator_color)
 
-    def is_collision_risk(self, det, class_id):
+    def clamp01(self, value):
+        if value < 0.0:
+            return 0.0
+        if value > 1.0:
+            return 1.0
+        return value
+
+    def score_range(self, value, low, high):
+        if high <= low:
+            return 1.0 if value >= high else 0.0
+        return self.clamp01((value - low) / (high - low))
+
+    def get_detection_risk_score(self, det, class_id):
         x1, y1, w, h = det
         frame_w = float(self.display_size[0])
         frame_h = float(self.display_size[1])
@@ -262,24 +282,52 @@ class SegmentationApp(AIBase):
         label = self.labels[class_id]
 
         if label == "person":
-            large_enough = height_ratio >= 0.22 or area_ratio >= 0.035
+            size_score = max(
+                self.score_range(height_ratio, 0.08, 0.22),
+                self.score_range(area_ratio, 0.01, 0.035)
+            )
         else:
-            large_enough = width_ratio >= 0.16 or height_ratio >= 0.18 or area_ratio >= 0.05
+            size_score = max(
+                self.score_range(width_ratio, 0.05, 0.16),
+                self.score_range(height_ratio, 0.06, 0.18),
+                self.score_range(area_ratio, 0.01, 0.05)
+            )
 
-        in_driving_path = center_offset_ratio <= 0.22 or (center_offset_ratio <= 0.30 and width_ratio >= 0.18)
-        close_enough = bottom_ratio >= 0.60
-        return in_driving_path and close_enough and large_enough
+        path_score = self.clamp01((0.35 - center_offset_ratio) / 0.35)
+        if width_ratio >= 0.18:
+            path_score = max(path_score, self.clamp01((0.40 - center_offset_ratio) / 0.40))
+        bottom_score = self.score_range(bottom_ratio, 0.35, 0.60)
+        return self.clamp01((size_score * 0.35) + (path_score * 0.20) + (bottom_score * 0.45))
 
-    def has_alert_target(self, seg_res):
+    def is_collision_risk(self, det, class_id):
+        return self.get_detection_risk_score(det, class_id) >= self.alert_risk_threshold
+
+    def get_max_alert_risk(self, seg_res):
         if not seg_res[0]:
-            return False
+            return 0.0
 
+        max_risk = 0.0
         dets, ids = seg_res[0], seg_res[1]
         for det, class_id in zip(dets, ids):
             class_id = int(class_id)
-            if class_id in self.alert_label_ids and self.is_collision_risk(det, class_id):
-                return True
-        return False
+            if class_id in self.alert_label_ids:
+                max_risk = max(max_risk, self.get_detection_risk_score(det, class_id))
+        return max_risk
+
+    def get_max_vehicle_risk(self, seg_res):
+        if not seg_res[0]:
+            return 0.0
+
+        max_risk = 0.0
+        dets, ids = seg_res[0], seg_res[1]
+        for det, class_id in zip(dets, ids):
+            class_id = int(class_id)
+            if class_id in self.vehicle_label_ids:
+                max_risk = max(max_risk, self.get_detection_risk_score(det, class_id))
+        return max_risk
+
+    def has_alert_target(self, seg_res):
+        return self.get_max_alert_risk(seg_res) >= self.alert_risk_threshold
 
     def has_vehicle_target(self, seg_res):
         if not seg_res[0]:
@@ -412,9 +460,14 @@ if __name__ == "__main__":
                 img = pl.get_frame()
                 # 現在のフレームで推論 / Inference on current frame
                 seg_res = seg.run(img)
-                collision_risk = seg.has_alert_target(seg_res)
+                alert_risk_score = seg.get_max_alert_risk(seg_res)
+                vehicle_risk_score = seg.get_max_vehicle_risk(seg_res)
+                collision_risk = alert_risk_score >= seg.alert_risk_threshold
+                vehicle_detected = seg.has_vehicle_target(seg_res)
                 buzzer.update(alerts_enabled and collision_risk)
-                led.update(seg.has_vehicle_target(seg_res), collision_risk)
+                led_visible = vehicle_detected or collision_risk
+                led_risk_score = max(vehicle_risk_score, alert_risk_score)
+                led.update(led_visible, led_risk_score)
                 # 結果をPipeLineのosd画像に描画 / Draw results to PipeLine's osd image
                 seg.draw_result(pl, seg_res, buzzer_enabled=alerts_enabled)
                 # 現在の描画結果を表示 / Display current drawing results
