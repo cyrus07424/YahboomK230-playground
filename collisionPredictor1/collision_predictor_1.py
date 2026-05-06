@@ -16,6 +16,7 @@ import sys
 import aidemo
 from ybUtils.YbBuzzer import YbBuzzer
 from ybUtils.YbKey import YbKey
+from ybUtils.YbRGB import YbRGB
 
 # カスタムYOLOv8セグメンテーションクラス Custom YOLOv8 Segmentation Class
 
@@ -63,8 +64,35 @@ class AlertToggleButton:
         return self.enabled
 
 
+class LedIndicator:
+    OFF = (0, 0, 0)
+    GREEN = (0, 255, 0)
+    RED = (255, 0, 0)
+
+    def __init__(self):
+        self.led = YbRGB()
+        self.current_color = None
+        self.off()
+
+    def update(self, vehicle_detected, collision_risk):
+        if collision_risk:
+            self.show(self.RED)
+        elif vehicle_detected:
+            self.show(self.GREEN)
+        else:
+            self.show(self.OFF)
+
+    def off(self):
+        self.show(self.OFF)
+
+    def show(self, color):
+        if self.current_color != color:
+            self.led.show_rgb(color)
+            self.current_color = color
+
+
 class SegmentationApp(AIBase):
-    def __init__(self, kmodel_path, labels, model_input_size, confidence_threshold=0.2, nms_threshold=0.5, mask_threshold=0.5, rgb888p_size=[224, 224], display_size=[1920, 1080], debug_mode=0, alert_labels=("person", "bicycle", "car", "motorcycle", "bus", "truck")):
+    def __init__(self, kmodel_path, labels, model_input_size, confidence_threshold=0.2, nms_threshold=0.5, mask_threshold=0.5, rgb888p_size=[224, 224], display_size=[1920, 1080], debug_mode=0, alert_labels=("person", "bicycle", "car", "motorcycle", "bus", "truck"), vehicle_labels=("bicycle", "car", "motorcycle", "bus", "truck", "train", "boat")):
         """
         セグメンテーションアプリケーションクラスを初期化する
         Initialize the segmentation application class
@@ -90,6 +118,10 @@ class SegmentationApp(AIBase):
         for label in alert_labels:
             if label in self.labels:
                 self.alert_label_ids.add(self.labels.index(label))
+        self.vehicle_label_ids = set()
+        for label in vehicle_labels:
+            if label in self.labels:
+                self.vehicle_label_ids.add(self.labels.index(label))
         # モデル入力解像度 / Model input resolution
         self.model_input_size = model_input_size
         # 信頼度しきい値 / Confidence threshold
@@ -212,7 +244,7 @@ class SegmentationApp(AIBase):
     def draw_buzzer_indicator(self, pl, buzzer_enabled):
         indicator_text = "BZ ON" if buzzer_enabled else "BZ OFF"
         indicator_color = (255, 80, 220, 80) if buzzer_enabled else (255, 220, 80, 80)
-        indicator_x = self.display_size[0] - 150
+        indicator_x = self.display_size[0] - 100
         indicator_y = 10
         pl.osd_img.draw_string_advanced(indicator_x, indicator_y, 24, indicator_text, color=indicator_color)
 
@@ -246,6 +278,15 @@ class SegmentationApp(AIBase):
         for det, class_id in zip(dets, ids):
             class_id = int(class_id)
             if class_id in self.alert_label_ids and self.is_collision_risk(det, class_id):
+                return True
+        return False
+
+    def has_vehicle_target(self, seg_res):
+        if not seg_res[0]:
+            return False
+
+        for class_id in seg_res[1]:
+            if int(class_id) in self.vehicle_label_ids:
                 return True
         return False
 
@@ -342,6 +383,7 @@ if __name__ == "__main__":
         duration=BUZZER_DURATION,
         interval_ms=BUZZER_INTERVAL_MS
     )
+    led = LedIndicator()
     alert_toggle = AlertToggleButton(initial_enabled=ALERTS_ENABLED_AT_START)
 
     # カスタムYOLOV8セグメンテーションのサンプルを初期化 / Initialize custom YOLOV8 segmentation example
@@ -370,7 +412,9 @@ if __name__ == "__main__":
                 img = pl.get_frame()
                 # 現在のフレームで推論 / Inference on current frame
                 seg_res = seg.run(img)
-                buzzer.update(alerts_enabled and seg.has_alert_target(seg_res))
+                collision_risk = seg.has_alert_target(seg_res)
+                buzzer.update(alerts_enabled and collision_risk)
+                led.update(seg.has_vehicle_target(seg_res), collision_risk)
                 # 結果をPipeLineのosd画像に描画 / Draw results to PipeLine's osd image
                 seg.draw_result(pl, seg_res, buzzer_enabled=alerts_enabled)
                 # 現在の描画結果を表示 / Display current drawing results
@@ -380,5 +424,6 @@ if __name__ == "__main__":
     finally:
         # リソースを解放 / Release resources
         buzzer.off()
+        led.off()
         seg.deinit()
         pl.destroy()
